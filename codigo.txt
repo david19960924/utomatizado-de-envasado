@@ -1,0 +1,443 @@
+#include <DHTesp.h>
+#include <ESP32Servo.h>
+#include <HX711.h>
+#include <Stepper.h>
+
+const int stepsPerRevolution = 2048;
+Stepper myStepper(stepsPerRevolution, 13, 12, 14, 26);
+
+const int LED = 2;
+
+unsigned long ultimoTiempoTemp = 0;
+unsigned long ultimoTiempoHum = 0;
+unsigned long ultimoTiempoEmer = 0;
+const unsigned long intervalo = 20000;  // 20 segundos
+
+#define BOTON_PIN 4
+volatile bool programaDetenido = false;
+volatile unsigned long ultimaInterrupcion = 0;
+
+void IRAM_ATTR detenerPrograma() {
+  if (millis() - ultimaInterrupcion > 200) {
+    programaDetenido = true;
+  }
+  ultimaInterrupcion = millis();
+}
+
+const int DHT_PIN = 17;
+DHTesp dhtSensor;
+TempAndHumidity data;
+
+const int servoPin = 32;
+Servo servo;
+int pos = 0;
+bool servoAdjuntado = true;  // Bandera para estado del servo
+
+const int ledPinRojo = 19;
+const int ledPinAmarillo = 18;
+const int ledPinVerde = 5;
+
+const int HX_DT = 33;
+const int HX_SCK = 27;
+HX711 balanza;
+
+// Sistema de filtrado
+const int NUM_LECTURAS = 15;
+float lecturasBalanza[NUM_LECTURAS];
+int indiceLectura = 0;
+float totalLecturas = 0;
+float peso = 0;
+float pesoEnvase = 0;
+
+enum SistemaEstado {
+  ESPERANDO_ENVASE,
+  LLENANDO,
+  CERRANDO_TOLVA,
+  ESPERANDO_RETIRO,
+  AVANZANDO_CINTA,
+  REINICIANDO_BALANZA
+};
+SistemaEstado estado = ESPERANDO_ENVASE;
+
+const float ENVASE_MIN = 18.0;
+const float ENVASE_MAX = 22.0;
+const float PRODUCTO_MIN = 9.0;
+const float PRODUCTO_MAX = 10.0;
+const float MARGEN_ERROR = 0.05;
+const float UMBRAL_CERO = 1.0;
+
+unsigned long tiempoUltimaLectura = 0;
+const unsigned long intervaloLectura = 30000;  // 30 segundos
+unsigned long tiempoActual = millis();
+
+
+// Control de impresión
+unsigned long ultimoPrintEstado = 0;
+const unsigned long INTERVALO_PRINT_ESTADO = 2000;
+
+
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED, OUTPUT);
+
+  // Inicialización del servo
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  servo.setPeriodHertz(50);  // Frecuencia estándar para servos
+  servo.attach(servoPin, 500, 2400);
+  servo.write(90);  // Posición inicial cerrada
+  delay(500);
+  Serial.println("[SERVO] Inicializado en posición cerrada");
+  
+  pinMode(BOTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BOTON_PIN), detenerPrograma, RISING);
+
+  dhtSensor.setup(DHT_PIN, DHTesp::DHT22);
+
+  pinMode(ledPinRojo, OUTPUT);
+  pinMode(ledPinAmarillo, OUTPUT);
+  pinMode(ledPinVerde, OUTPUT);
+  digitalWrite(ledPinVerde, HIGH);
+  digitalWrite(ledPinAmarillo, LOW);
+  digitalWrite(ledPinRojo, LOW);
+
+  // Inicialización de balanza
+  balanza.begin(HX_DT, HX_SCK);
+  delay(2000);
+  balanza.set_scale(1011.f);
+  balanza.tare(20);
+  
+  // Inicializar filtro
+  for (int i = 0; i < NUM_LECTURAS; i++) {
+    lecturasBalanza[i] = 0;
+  }
+  totalLecturas = 0;
+  indiceLectura = 0;
+  
+  // Inicializar motor paso a paso
+  myStepper.setSpeed(10);  // RPM
+  pinMode(13, OUTPUT);
+  pinMode(12, OUTPUT);
+  pinMode(14, OUTPUT);
+  pinMode(26, OUTPUT);
+  
+  Serial.println("[SISTEMA] Inicialización completa");
+  Serial.println("--------------------------------");
+  leerSensoresAmbientales();
+  avanzarCintaTransportadora();
+}
+
+void loop() {
+  unsigned long tiempoActual = millis();
+ checkEmergencia();
+
+ actualizarLecturaBalanza();
+
+
+  ejecutarCicloLlenado();
+ delay(10);
+}
+
+
+
+void leerSensoresAmbientales() {
+  data = dhtSensor.getTempAndHumidity();
+  Serial.println("Temp: " + String(data.temperature, 2) + "°C | Hum: " + String(data.humidity, 1) + "%");
+}
+
+
+
+
+
+void actualizarLecturaBalanza() {
+  if (!balanza.wait_ready_timeout(200)) {
+    return;
+  }
+  
+  float nuevaLectura = balanza.get_units(1);
+  
+  // Actualizar filtro de media móvil
+  totalLecturas = totalLecturas - lecturasBalanza[indiceLectura];
+  lecturasBalanza[indiceLectura] = nuevaLectura;
+  totalLecturas = totalLecturas + nuevaLectura;
+  indiceLectura = (indiceLectura + 1) % NUM_LECTURAS;
+  
+  peso = totalLecturas / NUM_LECTURAS;
+}
+
+void ejecutarCicloLlenado() {
+  // Solo imprimir estado periódicamente
+  if (millis() - ultimoPrintEstado > INTERVALO_PRINT_ESTADO) {
+    switch (estado) {
+      case ESPERANDO_ENVASE:
+        Serial.println("[ESTADO] Esperando envase (18-22g)");
+        break;
+      case LLENANDO:
+        Serial.println("[ESTADO] Llenando producto (9-10g)");
+        break;
+      case CERRANDO_TOLVA:
+        Serial.println("[ESTADO] Cerrando tolva");
+        break;
+      case AVANZANDO_CINTA:
+        Serial.println("[ESTADO] Avanzando cinta");
+        break;
+      case ESPERANDO_RETIRO:
+        Serial.println("[ESTADO] Esperando retiro manual");
+        break;
+      case REINICIANDO_BALANZA:
+        Serial.println("[ESTADO] Reiniciando balanza");
+        break;
+    }
+    ultimoPrintEstado = millis();
+  }
+
+  switch (estado) {
+    case ESPERANDO_ENVASE:
+    
+      if (detectarEnvase()) {
+        estado = LLENANDO;
+        Serial.println("[TRANSICION] -> LLENANDO");
+      }
+      break;
+      
+    case LLENANDO:
+      
+      if (verificarPesoLlenado()) {
+        estado = CERRANDO_TOLVA;
+        Serial.println("[TRANSICION] -> CERRANDO_TOLVA");
+      }
+      break;
+      
+    case CERRANDO_TOLVA:
+      
+      cerrarTolva();
+      estado = ESPERANDO_RETIRO;
+      Serial.println("[TRANSICION] -> ESPERANDO_RETIRO");
+      break;
+
+    case ESPERANDO_RETIRO:
+      
+      esperarRetiroEnvase();
+      break;
+      
+    case AVANZANDO_CINTA:
+     
+      avanzarCintaTransportadora();
+      Serial.println("[TRANSICION] -> ESPERANDO_ENVASE");
+      estado= ESPERANDO_ENVASE;
+      break;
+      
+   
+      
+    case REINICIANDO_BALANZA:
+      
+      if (reiniciarBalanza()) {
+        estado =AVANZANDO_CINTA;
+        Serial.println("[TRANSICION] -> AVANZANDO_CINTA");
+      }
+      break;
+  }
+}
+
+bool detectarEnvase() {
+
+  
+  checkAmbiente();
+  float minAceptable = ENVASE_MIN * (1 - MARGEN_ERROR);
+  float maxAceptable = ENVASE_MAX * (1 + MARGEN_ERROR);
+  
+
+
+  if (peso >= minAceptable && peso <= maxAceptable) {
+    if (verificarEstabilidad(1000, 0.5)) {  // Reducido a 1 segundo para pruebas
+      pesoEnvase = peso;
+      Serial.print("[DETECCION] Envase: ");
+      Serial.print(pesoEnvase, 1);
+      Serial.println("g");
+      abrirTolva();
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+bool verificarEstabilidad(unsigned long duracion, float maxVariacion) {
+  unsigned long inicio = millis();
+  float minPeso = peso;
+  float maxPeso = peso;
+  
+  while (millis() - inicio < duracion) {
+    if (programaDetenido) return false;
+    
+    actualizarLecturaBalanza();
+    
+    if (peso < minPeso) minPeso = peso;
+    if (peso > maxPeso) maxPeso = peso;
+    
+    if ((maxPeso - minPeso) > maxVariacion) {
+      minPeso = peso;
+      maxPeso = peso;
+      inicio = millis();
+    }
+    
+    delay(100);
+  }
+  
+  return true;
+}
+
+bool verificarPesoLlenado() {
+  float pesoObjetivoMin = pesoEnvase + PRODUCTO_MIN * (1 - MARGEN_ERROR);
+  float pesoObjetivoMax = pesoEnvase + PRODUCTO_MAX * (1 + MARGEN_ERROR);
+  if (peso >= pesoObjetivoMin) {
+    if (peso > pesoObjetivoMax) {
+      Serial.println("[ALERTA] ¡Sobrellenado detectado!");
+    }
+    return true;
+  }
+  return false;
+}
+
+void abrirTolva() {
+
+  
+  Serial.println("[ACCION] Abriendo tolva...");
+   for (pos = 90; pos >= 0; pos -= 1) {
+    if (programaDetenido) return;
+    servo.write(pos);
+    delay(15);
+  }
+  delay(2000);
+  
+  Serial.println("[OK] Tolva abierta");
+  delay(1000);
+}
+
+void cerrarTolva() {
+  
+   
+  Serial.println("[ACCION] Cerrando tolva...");
+  
+  for (pos = 0; pos <= 90; pos += 1) {
+     if (programaDetenido) return;
+    servo.write(pos);
+    delay(15);
+  }
+  Serial.println("[OK] Tolva cerrada");
+  delay(1000);
+}
+
+void avanzarCintaTransportadora() {
+  
+  
+  Serial.println("[ACCION] Avanzando cinta...");
+  
+  // Control directo de pines para asegurar funcionamiento
+  digitalWrite(13, LOW);
+  digitalWrite(12, LOW);
+  digitalWrite(14, LOW);
+  digitalWrite(26, LOW);
+  delay(50);
+  
+  myStepper.step(stepsPerRevolution * 1);  // Solo 1 revolución
+  Serial.println("[OK] Cinta avanzada");
+  
+  // Apagar pines del motor
+  digitalWrite(13, LOW);
+  digitalWrite(12, LOW);
+  digitalWrite(14, LOW);
+  digitalWrite(26, LOW);
+}
+
+void esperarRetiroEnvase() {
+
+  static unsigned long ultimoMensaje = 0;
+    // Verificar si el peso ha bajado a cero
+  if (abs(peso) < UMBRAL_CERO) {
+    Serial.println("[OK] Envase retirado");
+    estado = REINICIANDO_BALANZA;
+    return;
+  }
+  
+
+  
+  delay(100);
+}
+
+bool reiniciarBalanza() {
+  
+  Serial.println("[BALANZA] Realizando tara...");
+  balanza.tare(10);
+  
+  // Resetear variables de peso
+  peso = 0;
+  pesoEnvase = 0;
+  
+  // Resetear filtro
+  for (int i = 0; i < NUM_LECTURAS; i++) {
+    lecturasBalanza[i] = 0;
+  }
+  totalLecturas = 0;
+  indiceLectura = 0;
+  
+  Serial.println("[OK] Balanza en cero");
+  return true;
+}
+void checkEmergencia() {
+  if (programaDetenido) {
+    // Detener todos los actuadores primero
+    servo.detach();
+    digitalWrite(13, LOW);
+    digitalWrite(12, LOW);
+    digitalWrite(14, LOW);
+    digitalWrite(26, LOW);
+    
+    // Apagar LEDs
+    digitalWrite(ledPinRojo, LOW);
+    digitalWrite(ledPinAmarillo, LOW);
+    digitalWrite(ledPinVerde, LOW);
+    
+    // Estado de emergencia
+  
+   
+    while (true) {
+        unsigned long tiempoActualE = millis();
+      if (tiempoActualE - ultimoTiempoEmer >= intervalo) {
+      Serial.println("[EMERGENCIA] Sistema detenido. Presione RESET para reiniciar.");
+      delay(1000);
+      ultimoTiempoEmer = tiempoActualE;
+    }
+     
+    }
+    
+  }
+}
+void checkAmbiente() {
+  data = dhtSensor.getTempAndHumidity();
+  unsigned long tiempoActualT = millis();
+  if (tiempoActualT - ultimoTiempoTemp >= intervalo) {
+  if (data.temperature > 22) {
+    digitalWrite(ledPinRojo, HIGH);   // Enciende LED rojo
+    Serial.println("TEMPERATURA ELEVADA.");
+    ultimoTiempoTemp = tiempoActualT;
+  } else {
+    digitalWrite(ledPinRojo, LOW);    // Apaga LED rojo
+  }
+  
+  }
+  unsigned long tiempoActualH = millis();
+  if (tiempoActualH - ultimoTiempoHum >= intervalo) {
+  if (data.humidity> 90) {
+    digitalWrite(ledPinAmarillo, HIGH);  // Enciende LED amarillo
+    Serial.println("HUMEDAD ELEVADA.");
+    ultimoTiempoHum = tiempoActualH;
+  } else {
+    digitalWrite(ledPinAmarillo, LOW);   // Apaga LED amarillo
+  }
+  
+  }
+}
